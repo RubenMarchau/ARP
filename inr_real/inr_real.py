@@ -32,7 +32,8 @@ NAME = args.get("name", "tomo200528_110")
 PIXEL_SPACING = float(args.get("pixel", 20.0))
 MODEL_VOXEL = 20.0  # model coordinates are in units of the 20 A runs
 DETECTOR_SCALE = PIXEL_SPACING / MODEL_VOXEL  # detector pixel -> model units
-REF_NY, REF_NX = 320, 330  # 20 A image size that defines the model box
+REF_NY, REF_NX = int(args.get("ref_ny", 320)), int(args.get("ref_nx", 330))  # field of view (model voxels) that defines the box
+CELLS = tuple(float(c) for c in args.get("cells", "12,8,6,4,3,2").split(","))  # grid cell sizes in model voxels
 VOLTAGE = 200
 THICKNESS = float(args.get("thickness_nm", 200)) * 10 / MODEL_VOXEL  # in model voxels
 PATCH, MARGIN = 96, 8
@@ -126,7 +127,7 @@ def smoothstep_coordinates(u, n_nodes):
 
 
 class GridINR(torch.nn.Module):
-    def __init__(self, cell_sizes=tuple(float(c) for c in args.get("cells", "12,8,6,4,3,2").split(",")), n_features=2, width=64):
+    def __init__(self, cell_sizes=CELLS, n_features=2, width=64):
         super().__init__()
         size = (2 * BOX_HALF).cpu()
         nodes = [torch.ceil(size / c).long() + 1 for c in cell_sizes]  # (x, y, z) nodes per level
@@ -159,14 +160,27 @@ class GridINR(torch.nn.Module):
         return F.softplus(self.mlp(features.T).reshape(xyz.shape[:-1]), beta=20)
 
 
-TV_STEP = float(args.get("tv_step", 1.0))  # finite-difference step in model voxels (0.5 = 10 A)
+# finite-difference step in model voxels: half the finest cell by default, so TV2 sees every scale the grids can represent
+TV_STEP = float(args.get("tv_step", min(CELLS) / 2))
+
+
+TV_ROTATE = bool(int(args.get("tv_rotate", 0)))  # random stencil orientation per point, so TV2 has no preferred axes
+
+
+def random_rotations(n):
+    """Uniformly random rotation matrices (n, 3, 3), from normalised quaternions."""
+    w, x, y, z = F.normalize(torch.randn(n, 4, device=device), dim=-1).unbind(-1)
+    return torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+                        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+                        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1).reshape(n, 3, 3)
 
 
 def second_order_tv(model, n_points=65536):
     """Mean Frobenius norm of the finite-difference Hessian (in units of model voxels squared, so the step size only
     changes which scales it sees, not the overall strength) at random points anywhere in the box."""
     points = torch.rand(n_points, 3, device=device) * (BOX_HIGH - BOX_LOW) + BOX_LOW
-    steps = torch.eye(3, device=device) * TV_STEP
+    axes = random_rotations(n_points) if TV_ROTATE else torch.eye(3, device=device).expand(n_points, 3, 3)
+    steps = [axis * TV_STEP for axis in axes.unbind(1)]
     values = model(points)
     hessian = []
     for i in range(3):
@@ -176,6 +190,37 @@ def second_order_tv(model, n_points=65536):
                      - model(points - steps[i] + steps[j]) + model(points - steps[i] - steps[j])) / 4
             hessian += [mixed, mixed]
     return torch.sqrt(torch.stack(hessian).pow(2).sum(0) + 1e-12).mean() / TV_STEP ** 2
+
+
+TGV = bool(int(args.get("tgv", 0)))  # second-order TGV instead of TV2, with alpha_0 = tv
+TGV_ALPHA1 = float(args.get("tgv_alpha1", 1.2))  # features narrower than about 2 alpha_0 / alpha_1 pay the first-order term
+TGV_CELL = float(args.get("tgv_cell", 4.0))  # cell size of the helper field w, in model voxels
+
+
+class TGVField(torch.nn.Module):
+    """Helper field w (a vector per point) of TGV: the smooth part of the density gradient."""
+
+    def __init__(self):
+        super().__init__()
+        n = torch.ceil((2 * BOX_HALF).cpu() / TGV_CELL).long() + 1
+        self.grid = torch.nn.Parameter(torch.zeros(1, 3, n[2], n[1], n[0]))
+
+    def forward(self, xyz):
+        box = ((xyz - BOX_CENTER) / BOX_HALF).reshape(1, 1, 1, -1, 3)
+        return F.grid_sample(self.grid, box, align_corners=True, padding_mode="border").reshape(3, -1).T
+
+
+def tgv_terms(model, field, n_points=65536):
+    """The two terms of TGV2(f) = min_w alpha_1 |grad f - w| + alpha_0 |E(w)|, E being the symmetrised gradient, as means
+    over random points, per model voxel. With w = grad f the second term is the Hessian norm of second_order_tv."""
+    points = torch.rand(n_points, 3, device=device) * (BOX_HIGH - BOX_LOW) + BOX_LOW
+    steps = torch.eye(3, device=device) * TV_STEP
+    gradient = torch.stack([(model(points + steps[i]) - model(points - steps[i])) / (2 * TV_STEP) for i in range(3)], -1)
+    first = torch.sqrt((gradient - field(points)).pow(2).sum(-1) + 1e-12).mean()
+    field_steps = torch.eye(3, device=device) * TGV_CELL / 2
+    jacobian = torch.stack([(field(points + field_steps[i]) - field(points - field_steps[i])) / TGV_CELL for i in range(3)], -1)
+    second = torch.sqrt(((jacobian + jacobian.transpose(1, 2)) / 2).pow(2).sum((1, 2)) + 1e-12).mean()
+    return first, second
 
 
 patch_1d = torch.arange(PATCH, device=device)
@@ -241,14 +286,69 @@ def random_patches(n, generator=None):
              torch.randint(NX - PATCH + 1, (1,), generator=generator).item()) for _ in range(n)]
 
 
+SAMPLER = args.get("sampler", "random")  # "random"; "tiled": every pixel exactly once per epoch; "subsets": see below
+N_SUBSETS = int(args.get("n_subsets", 5))  # "subsets": each step accumulates whole images of tilts s, s+K, s+2K, ...
+N_RANDOM_TILTS = int(args.get("n_tilts", 10))  # "random_tilts": each step accumulates whole images of this many random tilts
+_tile_queue = []
+_subset_queue = []
+
+
+def tiled_epoch(tilts=range(N_TILTS)):
+    """One epoch of patches whose inner regions tile every tilt image exactly once (random tiling offset per tilt and
+    epoch, shuffled order), so no pixel is skipped or over-visited."""
+    inner = PATCH - 2 * MARGIN
+    patches = []
+    for tilt in tilts:
+        oy, ox = torch.randint(inner, (2,)).tolist()
+        for y in range(oy - inner, NY, inner):
+            for x in range(ox - inner, NX, inner):
+                if y + inner > 0 and x + inner > 0:
+                    patches.append((tilt, y - MARGIN, x - MARGIN))
+    return [patches[i] for i in torch.randperm(len(patches)).tolist()]
+
+
 def training_patches(n):
     """With FULL_COVERAGE every image pixel is equally likely to fall in a patch's inner region."""
+    if SAMPLER == "tiled":
+        while len(_tile_queue) < n:
+            _tile_queue.extend(tiled_epoch())
+        return [_tile_queue.pop() for _ in range(n)]
     if not FULL_COVERAGE:
         return random_patches(n)
     low = -(PATCH - MARGIN) + 1
     return [(torch.randint(N_TILTS, (1,)).item(),
              torch.randint(low, NY - MARGIN, (1,)).item(),
              torch.randint(low, NX - MARGIN, (1,)).item()) for _ in range(n)]
+
+
+def subset_patches():
+    """All patches tiling every image of one interleaved tilt subset (ordered subsets): each step then sees the whole
+    volume from well-separated directions. The subsets are visited in random order, each once per epoch.
+    With sampler=random_tilts, the tilts are instead drawn at random at each step."""
+    if SAMPLER == "random_tilts":
+        return tiled_epoch(torch.randperm(N_TILTS)[:N_RANDOM_TILTS].tolist())
+    if not _subset_queue:
+        _subset_queue.extend(torch.randperm(N_SUBSETS).tolist())
+    return tiled_epoch(range(_subset_queue.pop(), N_TILTS, N_SUBSETS))
+
+
+def accumulate_loss(model, half, patches, density, jitter, mask_name, micro_batch):
+    """Masked MSE over all patches, normalised by their total mask count, with backward per micro-batch so that memory
+    only depends on micro_batch. Returns the loss value (gradients are accumulated in place)."""
+    def mask_count(tilt, y0, x0):
+        return masks_padded[mask_name][tilt, PATCH + y0 + MARGIN:PATCH + y0 + PATCH - MARGIN,
+                                       PATCH + x0 + MARGIN:PATCH + x0 + PATCH - MARGIN].sum()
+    total_count = sum(mask_count(*p) for p in patches).clamp(min=1)
+    total = 0.0
+    for i in range(0, len(patches), micro_batch):
+        chunk = patches[i:i + micro_batch]
+        count = sum(mask_count(*p) for p in chunk)
+        if count == 0:
+            continue
+        loss = patch_loss(model, half, chunk, density, jitter, mask_name) * count / total_count
+        loss.backward()
+        total += loss.item()
+    return total
 
 
 validation_patches = random_patches(3 * N_TILTS, torch.Generator().manual_seed(0))  # unchanged, for comparability
@@ -275,8 +375,10 @@ def load_expanded(model, state):
     return n_old
 
 
-def train(train_half, val_half, n_steps, batch_size=BATCH, lr=1e-4, tv_weight=TV_WEIGHT, warmup_steps=100,
-          density_schedule=((0, 0.25), (200, 0.5)), eval_every=100, seed=1):
+def train(train_half, val_half, n_steps, batch_size=BATCH, lr=1e-4, tv_weight=TV_WEIGHT,
+          warmup_steps=int(args.get("warmup", 100)),
+          density_schedule=((0, 0.25), (int(args.get("density_switch", 200)), DENSITY)),
+          eval_every=int(args.get("eval_every", 100)), seed=1):
     torch.manual_seed(seed)
     model = GridINR().to(device)
     n_old = len(model.grids)  # levels trained at the old learning rate; new (finer) levels may use fine_lr
@@ -284,14 +386,23 @@ def train(train_half, val_half, n_steps, batch_size=BATCH, lr=1e-4, tv_weight=TV
         resume = args["resume"].replace("HALF", ["even", "odd"][train_half])
         state = torch.load(resume, map_location=device)
         n_old = load_expanded(model, state.get("state", state))
-        density_schedule, warmup_steps = ((0, DENSITY),), 100
+        density_schedule = ((0, DENSITY),)
         print("warm start from", resume)
     print("parameters", sum(p.numel() for p in model.parameters()))
+    field = TGVField().to(device) if TGV else None
+
+    def prior():
+        if TGV:
+            first, second = tgv_terms(model, field)
+            return TGV_ALPHA1 * first + tv_weight * second
+        return tv_weight * second_order_tv(model)
+
     optimizer = torch.optim.Adam([
         {"params": list(model.grids.parameters())[:n_old], "lr": float(args.get("grid_lr", lr))},
         {"params": list(model.grids.parameters())[n_old:], "lr": float(args.get("fine_lr", args.get("grid_lr", lr)))},
         {"params": model.mlp.parameters(), "lr": float(args.get("mlp_lr", lr))},
         {"params": [model.tilt_offset, model.tilt_log_gain], "lr": 1e-2},
+        {"params": list(field.parameters()) if TGV else [], "lr": float(args.get("tgv_lr", 1e-4))},
     ])
     decay_steps = int(args.get("decay_steps", 0))  # cosine decay to 1/10 of every learning rate over decay_steps
     decay_start = int(args.get("decay_start", 0))  # constant learning rate before this step
@@ -309,10 +420,15 @@ def train(train_half, val_half, n_steps, batch_size=BATCH, lr=1e-4, tv_weight=TV
     start = time.time()
     for step in range(1, n_steps + 1):
         density = [d for s, d in density_schedule if step >= s][-1]
-        loss = patch_loss(model, train_half, training_patches(batch_size), density, jitter=True,
-                          mask_name="train" if FULL_COVERAGE else "validation")
+        mask_name = "train" if FULL_COVERAGE else "validation"
         optimizer.zero_grad()
-        (loss + tv_weight * second_order_tv(model) if tv_weight > 0 else loss).backward()
+        if SAMPLER in ("subsets", "random_tilts"):  # gradient accumulation over whole images, then one TV term and one step
+            loss = torch.tensor(accumulate_loss(model, train_half, subset_patches(), density, True, mask_name, batch_size))
+            if tv_weight > 0:
+                prior().backward()
+        else:
+            loss = patch_loss(model, train_half, training_patches(batch_size), density, jitter=True, mask_name=mask_name)
+            (loss + prior() if tv_weight > 0 else loss).backward()
         optimizer.step()
         warmup.step()
         if step % eval_every == 0 or step == n_steps:
@@ -326,6 +442,9 @@ def train(train_half, val_half, n_steps, batch_size=BATCH, lr=1e-4, tv_weight=TV
             if device == "mps":
                 torch.mps.empty_cache()  # release cached blocks so memory does not creep up over a run
             print(f"step {step} train {loss.item():.4f} val {val:.5f} ({time.time() - start:.0f} s)", flush=True)
+            if TGV:
+                first, second = tgv_terms(model, field)
+                print(f"  tgv first {first.item():.5f} second {second.item():.5f} tv2 {second_order_tv(model).item():.5f}", flush=True)
     model.load_state_dict(best["state"])
     return model, history, best["step"]
 

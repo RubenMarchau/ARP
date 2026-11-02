@@ -1,7 +1,7 @@
 # INR reconstruction of real even/odd tilt-series
 
 Scripts to fit a grid INR (positivity + second-order TV) to each half of a real, aligned tilt-series, following the
-simulation work in `INR_even_odd.ipynb`. Developed on `tomo200528_110` (Warp, 200 kV, 35 tilts, ±57°).
+simulation work in `INR_even_odd.ipynb`. Developed on `tomo200528_110` (Warp, 200 kV, 35 tilts, +57° to −45°).
 
 ## Input
 
