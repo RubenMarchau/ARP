@@ -154,7 +154,7 @@ class GridINR(torch.nn.Module):
         box = ((xyz - BOX_CENTER) / BOX_HALF).reshape(1, 1, 1, -1, 3)
         features = torch.cat([
             F.grid_sample(level, smoothstep_coordinates((box + offset) / extent, n), align_corners=True,
-                          padding_mode="border").reshape(level.shape[1], -1)
+                        padding_mode="border").reshape(level.shape[1], -1)
             for level, offset, extent, n in zip(self.grids, self.offsets, self.extent, self.n_nodes)
         ])
         return F.softplus(self.mlp(features.T).reshape(xyz.shape[:-1]), beta=20)
